@@ -1,4 +1,5 @@
 library(shiny)
+library(dplyr)
 library(ggplot2)
 library(lubridate)
 
@@ -73,9 +74,9 @@ ui <- fluidPage(
                              textOutput("range_missed"),
                              textOutput("range_late"),
                              plotOutput("plot_main"),
+                             plotOutput("plot_late_time"),
                              plotOutput("plot_missed_day"),
                              plotOutput("plot_late_day"),
-                             plotOutput("plot_late_time"),
                            ),
                          )
                   ),
@@ -88,12 +89,18 @@ ui <- fluidPage(
 
 ldf <- read.table(file = '/home/sparrow/soft/transloc/log.tsv.edited.tsv', sep = '\t', header = TRUE,colClasses=c("character","character","POSIXct","numeric"))
 ldf = ldf[seq(1, nrow(ldf), 25), ]
+ldf$time <- force_tz(ldf$time, tzone = "EST")
 
 odf <- read.table(file = '/home/sparrow/soft/transloc/log.tsv.observed.tsv', sep = '\t', header = TRUE,colClasses=c("POSIXct","numeric","character","numeric"))
+odf$time <- force_tz(odf$time, tzone = "EST")
 
 cdf=read.table(file = '/home/sparrow/soft/transloc/log.tsv.closest.tsv', sep = "\t", header = TRUE,colClasses=c("POSIXct","POSIXct","POSIXct","character"))
+cdf$scheduled <- force_tz(cdf$scheduled, tzone = "EST")
+cdf$observed <- force_tz(cdf$observed, tzone = "EST")
+cdf$observed_all <- force_tz(cdf$observed_all, tzone = "EST")
 cdf = cdf[order(cdf$scheduled),]
-cdf$diffs = abs(difftime(cdf$scheduled,cdf$observed_all,units="hours"))
+cdf$diff_hrs = abs(difftime(cdf$scheduled,cdf$observed_all,units="hours"))
+cdf$diff_mins = abs(difftime(cdf$scheduled,cdf$observed_all,units="mins"))
 cdf$day = lubridate::wday(cdf$scheduled,label=TRUE,abbr=FALSE)
 cdf$scheduled_time = strftime(cdf$scheduled, format="%H:%M:%S",tz="EST")
 cdf$date <- as.Date(cdf$scheduled)
@@ -111,7 +118,7 @@ server <- function(input, output) {
   #  
   #  cdf=read.table(file = '/home/sparrow/soft/transloc/log.tsv.closest.tsv', sep = "\t", header = TRUE,colClasses=c("POSIXct","POSIXct","POSIXct","character"))
   #  cdf = cdf[order(cdf$scheduled),]
-  #  cdf$diffs = abs(difftime(cdf$scheduled,cdf$observed_all,units="hours"))
+  #  cdf$diff_hrs = abs(difftime(cdf$scheduled,cdf$observed_all,units="hours"))
   #  cdf$date <- as.Date(cdf$scheduled)
   #})
   
@@ -119,10 +126,13 @@ server <- function(input, output) {
   vals <- reactiveValues()
 
   observe({
-    testdatetime <- paste(input$date,strftime(input$time, format="%H:%M:%S"))
-    testdatetime <- as.POSIXct(testdatetime, format="%Y-%m-%d %H:%M:%S",tz= "EST")
-    vals$start_datetime <- testdatetime[1]
-    vals$end_datetime <- testdatetime[2]
+    vals$start_end_time = strftime(input$time, format="%H:%M:%S")
+    #vals$start_end_time = force_tz(vals$start_end_time,tzone="EST")
+    vals$datetime_tmp1 <- paste(input$date,strftime(input$time, format="%H:%M:%S"))
+    vals$datetime_tmp2 <- as.POSIXct(vals$datetime_tmp1, format="%Y-%m-%d %H:%M:%S",tz="EST")
+    vals$start_datetime <- vals$datetime_tmp2[1]
+    vals$end_datetime <- vals$datetime_tmp2[2]
+    
     vals$stop <- input$stop
     vals$min_miss_time = input$min_miss_time
     vals$day = input$day
@@ -139,15 +149,16 @@ server <- function(input, output) {
   })
   
   output$total_missed <- renderText({
-    missed = cdf[cdf["diffs"]>=vals$min_miss_time/60,]
+    missed = cdf[cdf["diff_hrs"]>=vals$min_miss_time/60,]
     paste(c("Total number of missed busses since ",strftime(min(ldf$time)),": ", nrow(missed)), collapse = " ")
   })
   
   output$total_late <- renderText({
-    paste(c("Total amount of time wasted by busses being late since",strftime(min(ldf$time)),": ", round(sum(cdf$diffs),0)," hours"), collapse = " ")
+    paste(c("Total amount of time wasted by busses being late since",strftime(min(ldf$time)),": ", round(sum(cdf$diff_hrs),0)," hours"), collapse = " ")
   })
   
   output$plot_main <- renderPlot({
+    
     scdf = cdf[cdf$stop==vals$stop & cdf$scheduled>=vals$start_datetime & cdf$scheduled<=vals$end_datetime,]
     sldf = ldf[ldf$sid==vals$stop & ldf$time>=vals$start_datetime & ldf$time<=vals$end_datetime,]
     sodf = odf[odf$stop==vals$stop & odf$time>=vals$start_datetime & odf$time<=vals$end_datetime,]
@@ -162,40 +173,56 @@ server <- function(input, output) {
   })
   
   output$plot_missed_day <- renderPlot({
-    missed = cdf[cdf["diffs"]>=vals$min_miss_time/60,]
+    missed = cdf[cdf["diff_hrs"]>=vals$min_miss_time/60,]
     
     tcdf = missed[missed$stop==vals$stop,]
-    mcdf = aggregate(tcdf$diffs, by=list(tcdf$date),length)
+    mcdf = aggregate(tcdf$diff_hrs, by=list(tcdf$date),length)
     names(mcdf) = c("date","count")
     
     p<-ggplot(data=mcdf, aes(x=date, y=count)) +
-      geom_bar(stat="identity")
+      geom_bar(stat="identity") +
+      ggtitle("Number of busses missed per day")
     p
   })
   
   output$plot_late_day <- renderPlot({
     tcdf = cdf[cdf$stop==vals$stop,]
-    rcdf = aggregate(tcdf$diffs, by=list(tcdf$date), sum)
+    rcdf = aggregate(tcdf$diff_hrs, by=list(tcdf$date), sum)
     names(rcdf) = c("date","hrs")
     
     p<-ggplot(data=rcdf, aes(x=date, y=hrs)) +
-      geom_bar(stat="identity")
+      geom_bar(stat="identity") +
+      ggtitle("Total lateness per day")
     p
   })
   
   output$plot_late_time <- renderPlot({
-    lt = strptime(vals$stop_time, '%I:%M%p')
+    selected_start_time = strptime(vals$start_end_time[1], '%H:%M:%S')
+    selected_end_time = strptime(vals$start_end_time[2], '%H:%M:%S')
+    
+    selected_start_time = force_tz(selected_start_time,tzone="EST")
+    selected_end_time = force_tz(selected_end_time,tzone="EST")
+    
     s=NULL
     if(vals$day=="Weekday"){
-      s = cdf[(cdf$stop == vals$stop) & (cdf$day %in% c("Monday","Tuesday","Wednesday","Thursday","Friday")) & (cdf$scheduled_time==strftime(lt,format="%H:%M:%S")),]
+      s = cdf[(cdf$stop == vals$stop) & (cdf$day %in% c("Monday","Tuesday","Wednesday","Thursday","Friday")) & (cdf$scheduled_time>=strftime(selected_start_time,format="%H:%M:%S",tz= "EST")) & (cdf$scheduled_time<=strftime(selected_end_time,format="%H:%M:%S",tz= "EST")),]
     }
     else{
-      s = cdf[(cdf$stop == vals$stop) & (cdf$day==vals$day) & (cdf$scheduled_time==strftime(lt,format="%H:%M:%S")),]
+      s = cdf[(cdf$stop == vals$stop) & (cdf$day==vals$day) & (cdf$scheduled_time>=strftime(selected_start_time,format="%H:%M:%S",tz= "EST")) & (cdf$scheduled_time<=strftime(selected_end_time,format="%H:%M:%S",tz= "EST")),]
     }
     
-    p<-ggplot(s, aes(x=diffs)) + geom_histogram()
-    p
+    grp_df = s %>% group_by(scheduled_time) %>% summarize(mean(diff_mins))
+    colnames(grp_df) = c("scheduled_time","mean_diff_mins")
+    
+    g <- ggplot(NULL) +
+      geom_boxplot(data=s,aes(x=scheduled_time, y=diff_mins)) +
+      ggtitle("Scheduled stops") +
+      ylim(0,max(cdf$diff_mins))+
+      ylab("Average Lateness")+
+      theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+    g
   })
+  
 }
 
 # Run the application 

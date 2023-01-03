@@ -110,42 +110,47 @@ class Stop:
 		return
 
 	def depart(self,
-			   vehicle, # vehicle ID
+			   vid, # vehicle ID
 			   order_n, #
 			   min_dist_to_stop,
 			   min_dist_between_stops,
 			   min_time_between_stops): # returns 0 if no new departure detected - returns 1 if there is departure
-		assert vehicle.get_id() in self.v_distances,"requested vehicle is not available"
+		assert vid in self.v_distances,"requested vehicle is not available"
 
 		# find local minima etc
 		# get index of the closest point
-		closest_dist_idxs = argrelextrema(np.array(self.v_distances[vehicle.get_id()][1]),np.less_equal,order=order_n)[0] # todo: replace container list with np.array to avoid this ocnversion
+		closest_dist_idxs = argrelextrema(np.array(self.v_distances[vid][1]),np.less_equal,order=order_n)[0] # todo: replace container list with np.array to avoid this ocnversion
 		# select all that are also closer than min distance
-		closest_dist_idxs = [c for c in closest_dist_idxs if self.v_distances[vehicle.get_id()][1][c]<min_dist_to_stop]
+		closest_dist_idxs = [c for c in closest_dist_idxs if self.v_distances[vid][1][c]<min_dist_to_stop]
 		# remove duplicates close in time
 		res = []
 		for ci in closest_dist_idxs:
-			if any(abs(self.v_distances[vehicle.get_id()][0][ci] - timestamp_b) < min_time_between_stops for timestamp_b in self.v_distances[vehicle.get_id()][0][:ci]):
+			if any(abs(self.v_distances[vid][0][ci] - timestamp_b) < min_time_between_stops for timestamp_b in self.v_distances[vid][0][:ci]):
 				continue
 			res.append(ci)
 
-			# lastly make sure the bus travelled an appropriate distance before departure or is the first stop for the bus
-		found_stop = 0
-		prev_idx = 0
+		# make sure appropriate distance has been travelled or that the bus departed if the first in the day
+		closest_dist_idxs = []
 		for i,c in enumerate(res):
-			# we need to handle cases of the first departure of the day - there may not have been max distance reached yet
-			sub_dists = self.v_distances[vehicle.get_id()][1][prev_idx:c]
-			max_dist = max(sub_dists)
-			if (max_dist>=min_dist_between_stops) or \
-				(i==0 and not vehicle.has_departed()): # vehicle has not yet departed
-				self.observed_departures.append(self.v_distances[vehicle.get_id()][0][c])
-				print(self.name+" : "+str(self.observed_departures[-1]))
-				prev_idx = c
-				found_stop = 1
+			if i==len(res)-1: # last one
+				remaining_dists = self.v_distances[vid][1][c:]
+				if len(remaining_dists) and max(remaining_dists)>min_dist_to_stop: # departed from last observation
+					closest_dist_idxs.append(c)
+					found_stop = 1
+			else:
+				sub_dists = self.v_distances[vid][1][prev_idx:c]
+				if len(sub_dists)>0 and max(sub_dists)>=min_dist_between_stops:
+					closest_dist_idxs.append(c)
+					prev_idx = c
+					found_stop = 1
+
+		for c in closest_dist_idxs:
+			self.observed_departures.append(self.v_distances[vid][0][c])
+			print(self.name+" : "+str(self.observed_departures[-1]))
 
 		# lastly, clean up distances up until this departure to prepare for the next round
 		if found_stop:
-			self.v_distances[vehicle.get_id()][1] = self.v_distances[vehicle.get_id()][1][:prev_idx]
+			self.v_distances[vid][1] = self.v_distances[vid][1][:closest_dist_idxs[-1]]
 
 		# if departure is found - record it and remove the vehicle record up to this point
 		return found_stop
@@ -290,9 +295,7 @@ class Collector:
 				for sid,stop in self.stops.items():
 					timestamp = v["timestamp"]
 					stop_dist = stop.update(v["id"],timestamp,v["position"])
-					stop_departed = stop.depart(self.vehicles[v["id"]],self.order_n,self.min_dist_to_stop,self.min_dist_between_stops,self.min_time_between_stops) # check if departed - if did mark and edit accordingly - resets the vehicle history for the stop and for the vehicle
-					if stop_departed:
-						v.set_departed()
+					stop_departed = stop.depart(v["id"],self.order_n,self.min_dist_to_stop,self.min_dist_between_stops,self.min_time_between_stops) # check if departed - if did mark and edit accordingly - resets the vehicle history for the stop and for the vehicle
 
 					with lock:
 						out_line = str(sid)+","+str(v["id"])+","+str(timestamp)+","+str(stop_dist)+","+str(stop_departed)+"\n"

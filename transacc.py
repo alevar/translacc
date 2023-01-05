@@ -10,13 +10,19 @@ import threading
 import numpy as np
 import pandas as pd
 from itertools import product
+
+import slack
 from scipy.signal import argrelextrema
 from datetime import datetime, date, timezone, timedelta
+
+from slack import WebClient
+SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 
 # courtesy of https://www.omnicalculator.com/other/latitude-longitude-distance
 def deg2rad(deg):
 	rad = deg* math.pi / 180.0
 	return rad
+
 
 def sphDist(lat1,long1,lat2,long2):
 	r = 6371 * 1000
@@ -118,7 +124,6 @@ class Stop:
 		assert vid in self.v_distances,"requested vehicle is not available"
 
 		# find local minima etc
-		# get index of the closest point
 		closest_dist_idxs = argrelextrema(np.array(self.v_distances[vid][1]),np.less_equal,order=order_n)[0] # todo: replace container list with np.array to avoid this ocnversion
 		# select all that are also closer than min distance
 		closest_dist_idxs = [c for c in closest_dist_idxs if self.v_distances[vid][1][c]<min_dist_to_stop]
@@ -129,31 +134,47 @@ class Stop:
 				continue
 			res.append(ci)
 
+
+		# todo: need to define an approximate bubble within which the bus is considered to be stopped and not moving
+		# 		propagate minimum to the largest value within this range
+
 		# make sure appropriate distance has been travelled or that the bus departed if the first in the day
 		closest_dist_idxs = []
+		found_stop = 0
+		prev_idx = 0
+		trim_to_idx = 0 # index to which the observations are to be trimmed if stops found
 		for i,c in enumerate(res):
 			if i==len(res)-1: # last one
 				remaining_dists = self.v_distances[vid][1][c:]
-				if len(remaining_dists) and max(remaining_dists)>min_dist_to_stop: # departed from last observation
+				if len(remaining_dists)>0 and max(remaining_dists)>min_dist_to_stop: # departed from last observation
 					closest_dist_idxs.append(c)
 					found_stop = 1
+					trim_to_idx = len(self.v_distances[vid][1])
 			else:
-				sub_dists = self.v_distances[vid][1][prev_idx:c]
+				sub_dists = self.v_distances[vid][1][c:res[i+1]] # distance between current and next index
 				if len(sub_dists)>0 and max(sub_dists)>=min_dist_between_stops:
 					closest_dist_idxs.append(c)
 					prev_idx = c
 					found_stop = 1
+					trim_to_idx = res[i+1]
 
+		departures = []
 		for c in closest_dist_idxs:
 			self.observed_departures.append(self.v_distances[vid][0][c])
-			print(self.name+" : "+str(self.observed_departures[-1]))
+			print(self.name+" : "+str(vid)+" : "+datetime.fromtimestamp(self.observed_departures[-1]/1000).strftime("%c"))
+			departures.append([datetime.fromtimestamp(self.v_distances[vid][0][c]/1000).strftime("%c"),
+							   self.v_distances[vid][1][c]])
 
 		# lastly, clean up distances up until this departure to prepare for the next round
 		if found_stop:
-			self.v_distances[vid][1] = self.v_distances[vid][1][:closest_dist_idxs[-1]]
+			self.v_distances[vid][1] = self.v_distances[vid][1][trim_to_idx:]
 
 		# if departure is found - record it and remove the vehicle record up to this point
-		return found_stop
+		return departures
+
+	# todo: idintify missed schedule
+
+	# we could probably also tell if the bus that is on the route has crossed a stop or not thus detecting shuttles that are off-route-
 
 	def get_delta(self,t1,t2):
 		ct1 = datetime.combine(date.today(),t1)
@@ -218,6 +239,9 @@ class Collector:
 		self.min_dist_between_stops = 0
 		self.min_time_between_stops = 0
 
+		self.slack_client = None
+		self.slack_channel = None
+
 		# initialize output files
 		self.outdir = outdir.rstrip("/")+"/"
 		if not os.path.exists(self.outdir):
@@ -241,6 +265,10 @@ class Collector:
 
 	def set_order(self,order):
 		self.order_n = order
+
+	def set_slack(self,sc,channel):
+		self.slack_client = sc
+		self.slack_channel = channel
 
 	def init_logs(self):
 		if self.log_all_fp is not None:
@@ -287,18 +315,31 @@ class Collector:
 				continue
 
 			# update vehicle positioning if changed
-			timestamp = v["timestamp"]
 			self.vehicles.setdefault(v["id"],Vehicle(v["id"],v["route_id"]))
-			updated = self.vehicles[v["id"]].update(timestamp,v["position"])
+			updated = self.vehicles[v["id"]].update(v["timestamp"],v["position"])
 
 			if updated:
 				for sid,stop in self.stops.items():
-					timestamp = v["timestamp"]
-					stop_dist = stop.update(v["id"],timestamp,v["position"])
-					stop_departed = stop.depart(v["id"],self.order_n,self.min_dist_to_stop,self.min_dist_between_stops,self.min_time_between_stops) # check if departed - if did mark and edit accordingly - resets the vehicle history for the stop and for the vehicle
+					stop_dist = stop.update(v["id"],v["timestamp"],v["position"])
+					departures = stop.depart(v["id"],self.order_n,self.min_dist_to_stop,self.min_dist_between_stops,self.min_time_between_stops) # check if departed - if did mark and edit accordingly - resets the vehicle history for the stop and for the vehicle
+
+					stop_departed = 0
+					for d in departures:
+						stop_departed = 1
+						message = "{0} : {1} departed at {2} ({3})".format(stop.get_name(),v["id"],d[0],d[1])
+						try:
+							result = self.slack_client.chat_postMessage(
+								channel=self.slack_channel,
+								text=message
+							)
+
+						except:
+							print("error posting to slack: "+message)
+
+
 
 					with lock:
-						out_line = str(sid)+","+str(v["id"])+","+str(timestamp)+","+str(stop_dist)+","+str(stop_departed)+"\n"
+						out_line = str(sid)+","+str(v["id"])+","+str(v["timestamp"])+","+str(stop_dist)+","+str(stop_departed)+"\n"
 						self.log_all_fp.write(out_line)
 
 
@@ -380,6 +421,8 @@ class Collector:
 		assert found_route,"requested route was not found"
 
 def run(args):
+	sc = WebClient(SLACK_BOT_TOKEN)
+
 	if not os.path.exists(args.output):
 		os.mkdir(args.output)
 
@@ -390,6 +433,7 @@ def run(args):
 	collector.set_min_distance_between_stops(args.min_dist_between_stops)
 	collector.set_min_time_between_stops(args.min_time_diff)
 	collector.set_order(args.order)
+	collector.set_slack(sc,args.slack_channel)
 	collector.start_collecting()
 
 def main(args):
@@ -424,6 +468,10 @@ def main(args):
 						default=250,
 						type=int,
 						help="Minimum distance in meters between the location of the bus and location of the stop for the stop to be counted as reached.")
+	parser.add_argument("--slack_channel",
+						required=True,
+						type=str,
+						help="Name or ID of the slack chnnel to which the bot will post departures and other information")
 
 
 	parser.set_defaults(func=run)

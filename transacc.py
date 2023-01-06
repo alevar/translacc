@@ -73,7 +73,6 @@ class Vehicle:
 		self.vid = vid
 		self.route_id = route_id
 		self.travel = []
-		self.made_stop = False
 
 	def update(self,timestamp,position):
 		if len(self.travel) == 0 or timestamp>self.travel[-1][0]:
@@ -83,15 +82,9 @@ class Vehicle:
 
 	def reset(self):
 		self.travel = list()
-		self.has_departed = False
 
 	def get_id(self):
 		return self.vid
-
-	def set_departed(self):
-		self.made_stop = True
-	def has_departed(self):
-		return self.made_stop
 
 class Stop:
 	def __init__(self,id,code,name,position):
@@ -120,7 +113,8 @@ class Stop:
 			   order_n, #
 			   min_dist_to_stop,
 			   min_dist_between_stops,
-			   min_time_between_stops): # returns 0 if no new departure detected - returns 1 if there is departure
+			   min_time_between_stops,
+			   stop_radius): # returns 0 if no new departure detected - returns 1 if there is departure
 		assert vid in self.v_distances,"requested vehicle is not available"
 
 		# find local minima etc
@@ -133,10 +127,6 @@ class Stop:
 			if any(abs(self.v_distances[vid][0][ci] - timestamp_b) < min_time_between_stops for timestamp_b in self.v_distances[vid][0][:ci]):
 				continue
 			res.append(ci)
-
-
-		# todo: need to define an approximate bubble within which the bus is considered to be stopped and not moving
-		# 		propagate minimum to the largest value within this range
 
 		# make sure appropriate distance has been travelled or that the bus departed if the first in the day
 		closest_dist_idxs = []
@@ -160,10 +150,17 @@ class Stop:
 
 		departures = []
 		for c in closest_dist_idxs:
-			self.observed_departures.append(self.v_distances[vid][0][c])
+			# find the first index for which position is greater than radius
+			npl = self.v_distances[vid][1][c:]
+			cur_radius = npl[0]+stop_radius # minimum plus radius
+			radius_idx = np.argmax(npl>cur_radius)
+			if radius_idx>0:
+				radius_idx-=1 # we want index within radius not outside
+
+			self.observed_departures.append(self.v_distances[vid][0][c+radius_idx])
 			print(self.name+" : "+str(vid)+" : "+datetime.fromtimestamp(self.observed_departures[-1]/1000).strftime("%c"))
-			departures.append([datetime.fromtimestamp(self.v_distances[vid][0][c]/1000).strftime("%c"),
-							   self.v_distances[vid][1][c]])
+			departures.append([datetime.fromtimestamp(self.v_distances[vid][0][c+radius_idx]/1000).strftime("%c"),
+							   self.v_distances[vid][1][c+radius_idx]])
 
 		# lastly, clean up distances up until this departure to prepare for the next round
 		if found_stop:
@@ -209,6 +206,40 @@ class Stop:
 			self._closest(t1,t2,res,max_delta,recycle,future_only)
 
 	def reset(self):
+		# cleanup inactive vehicles
+		to_clean = []
+		reset_idxs = []
+		yesterday_date = datetime.today - timedelta(days = 1)
+		yesterday_midnight = datetime.combine(yesterday_date,datetime.min.time())
+		cur_time = datetime.now()
+		for vid,data in self.v_distances.items():
+			# find inactive buses
+			td = abs((data[0][-1]-cur_time).total_seconds())
+			if td>3600: # inacetive for over 1hr
+				to_clean.append(vid)
+				continue
+
+			# reset to before yesterdays midnight
+			prev_day_idx = None
+			for i,v in enumerate(data):
+				if v-yesterday_midnight<0: # value is before yesterdays midnight
+					prev_day_idx = i
+				else:
+					break
+			if prev_day_idx is not None:
+				reset_idxs.append([vid,i])
+
+
+		# cleanup inactive busses
+		for vid in to_clean:
+			del self.v_distances[vid]
+
+		# reset old
+		for vid,i in reset_idxs:
+			self.v_distances[vid][0] = self.v_distances[vid][0][i]
+			self.v_distances[vid][1] = self.v_distances[vid][1][i]
+
+		# reset the data to before the midnight so the first observation is after midnight
 		self.observed_departures = list()
 		self.v_distances = dict()
 
@@ -238,6 +269,7 @@ class Collector:
 		self.min_dist_to_stop = sys.maxsize
 		self.min_dist_between_stops = 0
 		self.min_time_between_stops = 0
+		self.stop_radius = 0
 
 		self.slack_client = None
 		self.slack_channel = None
@@ -247,6 +279,7 @@ class Collector:
 		if not os.path.exists(self.outdir):
 			os.mkdir(self.outdir)
 
+		self.log_date = datetime.now().date()
 		self.log_all_fname = None
 		self.log_all_fp = None
 
@@ -262,6 +295,9 @@ class Collector:
 
 	def set_min_time_between_stops(self,min_time_between_stops):
 		self.min_time_between_stops = min_time_between_stops
+
+	def set_stop_radius(self,stop_radius):
+		self.stop_radius = stop_radius
 
 	def set_order(self,order):
 		self.order_n = order
@@ -295,8 +331,10 @@ class Collector:
 		midnight = datetime.combine(date.today(),datetime.min.time()) # midnight
 		cur_time = datetime.combine(midnight.date(),datetime.now().time()) # by removing date from now and adding one from midnight - we ensure they are the same
 		time_delta = (cur_time-midnight).total_seconds()
-		if 86400-time_delta <= 1*60: # if within 1 minute of midnight - has to refresh
-			self.reset()
+
+		if self.log_date != date.today():
+			self.log_date = date.today()
+			res = self.reset() # todo: transfer data?
 
 		url = "https://feeds.transloc.com/3/vehicle_statuses?agencies=641&include_arrivals=true"
 		payload={}
@@ -321,7 +359,7 @@ class Collector:
 			if updated:
 				for sid,stop in self.stops.items():
 					stop_dist = stop.update(v["id"],v["timestamp"],v["position"])
-					departures = stop.depart(v["id"],self.order_n,self.min_dist_to_stop,self.min_dist_between_stops,self.min_time_between_stops) # check if departed - if did mark and edit accordingly - resets the vehicle history for the stop and for the vehicle
+					departures = stop.depart(v["id"],self.order_n,self.min_dist_to_stop,self.min_dist_between_stops,self.min_time_between_stops,self.stop_radius) # check if departed - if did mark and edit accordingly - resets the vehicle history for the stop and for the vehicle
 
 					stop_departed = 0
 					for d in departures:
@@ -432,6 +470,7 @@ def run(args):
 	collector.set_min_distance_to_stop(args.min_dist_to_stop)
 	collector.set_min_distance_between_stops(args.min_dist_between_stops)
 	collector.set_min_time_between_stops(args.min_time_diff)
+	collector.set_stop_radius(args.stop_radius)
 	collector.set_order(args.order)
 	collector.set_slack(sc,args.slack_channel)
 	collector.start_collecting()
@@ -468,6 +507,11 @@ def main(args):
 						default=250,
 						type=int,
 						help="Minimum distance in meters between the location of the bus and location of the stop for the stop to be counted as reached.")
+	parser.add_argument("--stop_radius",
+						required=False,
+						default=50,
+						type=int,
+						help="Radius of each stop. The time at which the bus is reported to have departed a stop is calulated as the last time it was within the radius of it's closest position to the stop. For example, if a bus stopped 10 meters past the designated stopping position, once departure has been calulated, the departure will be calulated as the last time the bus was recorded 10+50m away from the stop position.")
 	parser.add_argument("--slack_channel",
 						required=True,
 						type=str,

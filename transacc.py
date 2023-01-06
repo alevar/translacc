@@ -8,10 +8,8 @@ import argparse
 import requests
 import threading
 import numpy as np
-import pandas as pd
 from itertools import product
 
-import slack
 from scipy.signal import argrelextrema
 from datetime import datetime, date, timezone, timedelta
 
@@ -67,6 +65,9 @@ class Schedule:
 			return self.sun[-1]
 		else:
 			return self.week[-1]
+
+	def add_departure(self,vid,timestamp):
+		return
 
 class Vehicle:
 	def __init__(self,vid,route_id):
@@ -161,6 +162,10 @@ class Stop:
 			print(self.name+" : "+str(vid)+" : "+datetime.fromtimestamp(self.observed_departures[-1]/1000).strftime("%c"))
 			departures.append([datetime.fromtimestamp(self.v_distances[vid][0][c+radius_idx]/1000).strftime("%c"),
 							   self.v_distances[vid][1][c+radius_idx]])
+			# if a departure was found - update timetable
+			if self.schedule is None:
+				print("schedule is now None")
+			self.schedule.add_departure(vid,self.v_distances[vid][0][c+radius_idx])
 
 		# lastly, clean up distances up until this departure to prepare for the next round
 		if found_stop:
@@ -209,7 +214,7 @@ class Stop:
 		# cleanup inactive vehicles
 		to_clean = []
 		reset_idxs = []
-		yesterday_date = datetime.today - timedelta(days = 1)
+		yesterday_date = datetime.today() - timedelta(days = 1)
 		yesterday_midnight = datetime.combine(yesterday_date,datetime.min.time())
 		cur_time = datetime.now()
 		for vid,data in self.v_distances.items():
@@ -229,7 +234,6 @@ class Stop:
 			if prev_day_idx is not None:
 				reset_idxs.append([vid,i])
 
-
 		# cleanup inactive busses
 		for vid in to_clean:
 			del self.v_distances[vid]
@@ -238,10 +242,7 @@ class Stop:
 		for vid,i in reset_idxs:
 			self.v_distances[vid][0] = self.v_distances[vid][0][i]
 			self.v_distances[vid][1] = self.v_distances[vid][1][i]
-
-		# reset the data to before the midnight so the first observation is after midnight
-		self.observed_departures = list()
-		self.v_distances = dict()
+			# todo: same for self.departures
 
 	def set_schedule(self,week,sat,sun):
 		self.schedule = Schedule(week,sat,sun)
@@ -279,7 +280,7 @@ class Collector:
 		if not os.path.exists(self.outdir):
 			os.mkdir(self.outdir)
 
-		self.log_date = datetime.now().date()
+		self.log_date = date.today()
 		self.log_all_fname = None
 		self.log_all_fp = None
 
@@ -339,7 +340,12 @@ class Collector:
 		url = "https://feeds.transloc.com/3/vehicle_statuses?agencies=641&include_arrivals=true"
 		payload={}
 		headers = {}
-		response = requests.request("GET", url, headers=headers, data=payload)
+		response = ""
+		try:
+			response = requests.request("GET", url, headers=headers, data=payload)
+		except:
+			print("failed to get status at: "+datetime.today().strftime("%c"))
+			return
 
 		output = response.json()
 
@@ -357,14 +363,14 @@ class Collector:
 			updated = self.vehicles[v["id"]].update(v["timestamp"],v["position"])
 
 			if updated:
-				for sid,stop in self.stops.items():
-					stop_dist = stop.update(v["id"],v["timestamp"],v["position"])
-					departures = stop.depart(v["id"],self.order_n,self.min_dist_to_stop,self.min_dist_between_stops,self.min_time_between_stops,self.stop_radius) # check if departed - if did mark and edit accordingly - resets the vehicle history for the stop and for the vehicle
+				for sid in self.stops:
+					stop_dist = self.stops[sid].update(v["id"],v["timestamp"],v["position"])
+					departures = self.stops[sid].depart(v["id"],self.order_n,self.min_dist_to_stop,self.min_dist_between_stops,self.min_time_between_stops,self.stop_radius) # check if departed - if did mark and edit accordingly - resets the vehicle history for the stop and for the vehicle
 
 					stop_departed = 0
 					for d in departures:
 						stop_departed = 1
-						message = "{0} : {1} departed at {2} ({3})".format(stop.get_name(),v["id"],d[0],d[1])
+						message = "{0} : {1} departed at {2} ({3})".format(self.stops[sid].get_name(),v["id"],d[0],d[1])
 						try:
 							result = self.slack_client.chat_postMessage(
 								channel=self.slack_channel,
@@ -374,12 +380,9 @@ class Collector:
 						except:
 							print("error posting to slack: "+message)
 
-
-
 					with lock:
 						out_line = str(sid)+","+str(v["id"])+","+str(v["timestamp"])+","+str(stop_dist)+","+str(stop_departed)+"\n"
 						self.log_all_fp.write(out_line)
-
 
 	def start_collecting(self):
 		lock = threading.Lock()
@@ -430,12 +433,13 @@ class Collector:
 						self.stops[s] = None
 						found_stop = True
 						stop_sid = s
+						break
 
 		assert found_stop,"didn't find requested stop: "+stop_name
 
 		# lastly add additional information about the stops
 		for sid,s in rcv_stops.items():
-			if s["id"] in self.stops:
+			if s["id"] == stop_sid:
 				self.stops[s["id"]] = Stop(s["id"],s["code"],s["name"],s["position"])
 
 		return stop_sid

@@ -48,6 +48,24 @@ class Schedule:
 		self.sat = self.parse_times(sat)
 		self.sun =  self.parse_times(sun)
 
+		self.schedule = [[[x,[]] for x in self.week],
+						 [[x,[]] for x in self.week],
+						 [[x,[]] for x in self.week],
+						 [[x,[]] for x in self.week],
+						 [[x,[]] for x in self.week],
+						 [[x,[]] for x in self.sat],
+						 [[x,[]] for x in self.sun]]
+		self.schedule_sets = [0,0,0,0,0,0,0] # if set - means the day has been passed - that's how we know the week passed and the value needs cleaning
+
+	def reset(self):
+		self.schedule = [[[x,[]] for x in self.week],
+						 [[x,[]] for x in self.week],
+						 [[x,[]] for x in self.week],
+						 [[x,[]] for x in self.week],
+						 [[x,[]] for x in self.week],
+						 [[x,[]] for x in self.sat],
+						 [[x,[]] for x in self.sun]]
+
 	def parse_times(self,tms):
 		res = []
 		for x in tms:
@@ -66,7 +84,53 @@ class Schedule:
 		else:
 			return self.week[-1]
 
+	# colors - blue to red (black when not yet available) - blue means departed early - red means departed late
 	def add_departure(self,vid,timestamp):
+		# what if we simply assign the same departure to multiple stops? and then report the one which minimizes absolute difference?
+
+		# departure is observed
+		# does the last stop before the departure have a departure associated with it?
+		# assign to both previous and next stop
+		depart_weekday = timestamp.weekday()
+		depart_date = timestamp.date()
+		depart_time =  datetime.fromtimestamp(timestamp)
+
+		found_stop = False
+		next_idx = None
+
+		tomorrow_weekday = (depart_weekday+1)%7
+		if self.schedule_sets[tomorrow_weekday] == 1: # reset
+			self.schedule_sets[tomorrow_weekday] = 0
+			tmp = [x[0] for x in self.schedule[tomorrow_weekday]]
+			self.schedule[tomorrow_weekday] = [[x,[]] for x in tmp]
+
+		# set todays data as being written
+		self.schedule_sets[depart_weekday] = 1
+
+		for i in range(len(self.schedule[depart_weekday])):
+			stop_time = datetime.combine(depart_date,self.schedule[depart_weekday][i][0].time())
+			td = (depart_time-stop_time).total_seconds()
+			if td<0: # found the next stop
+				found_stop = True
+				# add to the next stop
+				self.schedule[depart_weekday][i][1].append(timestamp)
+			if i>0:
+				self.schedule[depart_weekday][i-1][1].append(timestamp)
+
+			if found_stop:
+				next_idx = i
+				break
+
+		# if the first of the day - i==0 - need to add to the previous days last stop
+		if next_idx == 0:
+			yesterday_weekday = (depart_weekday-1)%7
+			self.schedule[yesterday_weekday][-1][1].append(timestamp)
+
+		# if the last of the day - need to add to the next days first stop
+		if next_idx is None:
+			tomorrow_weekday = (depart_weekday+1)%7
+			self.schedule[tomorrow_weekday][0][1].append(timestamp)
+
 		return
 
 class Vehicle:
@@ -159,7 +223,7 @@ class Stop:
 				radius_idx-=1 # we want index within radius not outside
 
 			self.observed_departures.append(self.v_distances[vid][0][c+radius_idx])
-			print(self.name+" : "+str(vid)+" : "+datetime.fromtimestamp(self.observed_departures[-1]/1000).strftime("%c"))
+			print(self.name+" : "+str(vid)+" : "+str(len(self.v_distances[vid][1]))+" : "+datetime.fromtimestamp(self.observed_departures[-1]/1000).strftime("%c")+" : "+str(self.observed_departures[-1]))
 			departures.append([datetime.fromtimestamp(self.v_distances[vid][0][c+radius_idx]/1000).strftime("%c"),
 							   self.v_distances[vid][1][c+radius_idx]])
 			# if a departure was found - update timetable
@@ -169,14 +233,16 @@ class Stop:
 
 		# lastly, clean up distances up until this departure to prepare for the next round
 		if found_stop:
+			print("trim_index: "+str(trim_to_idx))
+			print(str(len(self.v_distances[vid][1])))
+			self.v_distances[vid][0] = self.v_distances[vid][0][trim_to_idx:]
 			self.v_distances[vid][1] = self.v_distances[vid][1][trim_to_idx:]
+			print(str(len(self.v_distances[vid][1])))
 
 		# if departure is found - record it and remove the vehicle record up to this point
 		return departures
 
 	# todo: idintify missed schedule
-
-	# we could probably also tell if the bus that is on the route has crossed a stop or not thus detecting shuttles that are off-route-
 
 	def get_delta(self,t1,t2):
 		ct1 = datetime.combine(date.today(),t1)
@@ -219,7 +285,7 @@ class Stop:
 		cur_time = datetime.now()
 		for vid,data in self.v_distances.items():
 			# find inactive buses
-			td = abs((data[0][-1]-cur_time).total_seconds())
+			td = abs((datetime.fromtimestamp(data[0][-1]/1000)-cur_time).total_seconds())
 			if td>3600: # inacetive for over 1hr
 				to_clean.append(vid)
 				continue
@@ -333,7 +399,7 @@ class Collector:
 		cur_time = datetime.combine(midnight.date(),datetime.now().time()) # by removing date from now and adding one from midnight - we ensure they are the same
 		time_delta = (cur_time-midnight).total_seconds()
 
-		if self.log_date != date.today():
+		if self.log_date != date.today(): # trigger resets and cleanup of old data
 			self.log_date = date.today()
 			res = self.reset() # todo: transfer data?
 
@@ -369,6 +435,7 @@ class Collector:
 
 					stop_departed = 0
 					for d in departures:
+
 						stop_departed = 1
 						message = "{0} : {1} departed at {2} ({3})".format(self.stops[sid].get_name(),v["id"],d[0],d[1])
 						try:

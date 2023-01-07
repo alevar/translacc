@@ -57,6 +57,8 @@ class Schedule:
 						 [[x,[]] for x in self.sun]]
 		self.schedule_sets = [0,0,0,0,0,0,0] # if set - means the day has been passed - that's how we know the week passed and the value needs cleaning
 
+		self.last_departure = datetime.now().time()
+
 	def reset(self):
 		self.schedule = [[[x,[]] for x in self.week],
 						 [[x,[]] for x in self.week],
@@ -91,9 +93,11 @@ class Schedule:
 		# departure is observed
 		# does the last stop before the departure have a departure associated with it?
 		# assign to both previous and next stop
-		depart_weekday = timestamp.weekday()
-		depart_date = timestamp.date()
-		depart_time =  datetime.fromtimestamp(timestamp)
+		tm = datetime.fromtimestamp(timestamp/1000)
+		depart_weekday = tm.weekday()
+		depart_date = tm.date()
+		depart_time =  tm.time()
+		self.last_departure = depart_time
 
 		found_stop = False
 		next_idx = None
@@ -108,14 +112,14 @@ class Schedule:
 		self.schedule_sets[depart_weekday] = 1
 
 		for i in range(len(self.schedule[depart_weekday])):
-			stop_time = datetime.combine(depart_date,self.schedule[depart_weekday][i][0].time())
-			td = (depart_time-stop_time).total_seconds()
+			stop_time = datetime.combine(depart_date,self.schedule[depart_weekday][i][0])
+			td = (tm-stop_time).total_seconds()
 			if td<0: # found the next stop
 				found_stop = True
 				# add to the next stop
-				self.schedule[depart_weekday][i][1].append(timestamp)
+				self.schedule[depart_weekday][i][1].append(depart_time)
 			if i>0:
-				self.schedule[depart_weekday][i-1][1].append(timestamp)
+				self.schedule[depart_weekday][i-1][1].append(depart_time)
 
 			if found_stop:
 				next_idx = i
@@ -124,14 +128,39 @@ class Schedule:
 		# if the first of the day - i==0 - need to add to the previous days last stop
 		if next_idx == 0:
 			yesterday_weekday = (depart_weekday-1)%7
-			self.schedule[yesterday_weekday][-1][1].append(timestamp)
+			self.schedule[yesterday_weekday][-1][1].append(depart_time)
 
 		# if the last of the day - need to add to the next days first stop
 		if next_idx is None:
 			tomorrow_weekday = (depart_weekday+1)%7
-			self.schedule[tomorrow_weekday][0][1].append(timestamp)
+			self.schedule[tomorrow_weekday][0][1].append(depart_time)
 
 		return
+
+	def get_late(self):
+		res = []
+		cnow = datetime.now()
+		cdate = cnow.date()
+		ctime = cnow.time()
+		weekday = cnow.weekday()
+		for s in self.schedule[weekday]:
+			if s[0] < self.last_departure: # not interested anymore - values will not update anymore since before the latest departure
+				continue
+			if s[0] > ctime: # found stop after the current time - no need to look further
+				break
+
+			stop_time = datetime.combine(cdate,s[0])
+			td = (stop_time-cnow).total_seconds()
+			if len(s[1])>0:
+				depart_time = datetime.combine(cdate,s[1][-1])
+				td = (stop_time - depart_time).total_seconds()
+
+			res.append([s[0],td])
+
+		# todo: report negative when departed earlier
+		# todo: only report if >n minutes late
+
+		return res
 
 class Vehicle:
 	def __init__(self,vid,route_id):
@@ -233,11 +262,8 @@ class Stop:
 
 		# lastly, clean up distances up until this departure to prepare for the next round
 		if found_stop:
-			print("trim_index: "+str(trim_to_idx))
-			print(str(len(self.v_distances[vid][1])))
 			self.v_distances[vid][0] = self.v_distances[vid][0][trim_to_idx:]
 			self.v_distances[vid][1] = self.v_distances[vid][1][trim_to_idx:]
-			print(str(len(self.v_distances[vid][1])))
 
 		# if departure is found - record it and remove the vehicle record up to this point
 		return departures
@@ -309,6 +335,9 @@ class Stop:
 			self.v_distances[vid][0] = self.v_distances[vid][0][i]
 			self.v_distances[vid][1] = self.v_distances[vid][1][i]
 			# todo: same for self.departures
+
+	def get_late(self):
+		return self.schedule.get_late()
 
 	def set_schedule(self,week,sat,sun):
 		self.schedule = Schedule(week,sat,sun)
@@ -391,6 +420,15 @@ class Collector:
 
 		self.init_logs()
 
+	def collect_late(self):
+		res = {}
+
+		for sid,s in self.stops.items():
+			sres = s.get_late()
+			res[sid]=sres
+
+		return res
+
 	def _collecting(self,lock):
 		threading.Timer(1.0, self._collecting,[lock]).start()
 
@@ -435,7 +473,6 @@ class Collector:
 
 					stop_departed = 0
 					for d in departures:
-
 						stop_departed = 1
 						message = "{0} : {1} departed at {2} ({3})".format(self.stops[sid].get_name(),v["id"],d[0],d[1])
 						try:
@@ -450,6 +487,18 @@ class Collector:
 					with lock:
 						out_line = str(sid)+","+str(v["id"])+","+str(v["timestamp"])+","+str(stop_dist)+","+str(stop_departed)+"\n"
 						self.log_all_fp.write(out_line)
+
+		# collect lateness info
+		# since it's being collected independent of departures
+		# it can detect when something is behind schedule before a new departure occurs
+		lateness = self.collect_late()
+		for sid,lv in lateness.items():
+			for l in lv:
+				hrs = l[1] // 3600
+				mns = (l[1] % 3600) // 60
+				sec = l[1] % 60
+				message = "{0} : {1} has not yet departed ({2}:{3}:{4}))".format(self.stops[sid].get_name(),str(l[0]),str(hrs),str(mns),str(sec))
+				print(message)
 
 	def start_collecting(self):
 		lock = threading.Lock()

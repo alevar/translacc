@@ -150,12 +150,9 @@ class Schedule:
 				break
 
 			stop_time = datetime.combine(cdate,s[0])
-			td = (stop_time-cnow).total_seconds()
-			if len(s[1])>0:
-				depart_time = datetime.combine(cdate,s[1][-1])
-				td = (stop_time - depart_time).total_seconds()
+			td = (cnow-stop_time).total_seconds()
 
-			res.append([s[0],td])
+			res.append([s[0],abs(td)])
 
 		# todo: report negative when departed earlier
 		# todo: only report if >n minutes late
@@ -318,7 +315,7 @@ class Stop:
 
 			# reset to before yesterdays midnight
 			prev_day_idx = None
-			for i,v in enumerate(data):
+			for i,v in enumerate(data[0]):
 				if v-yesterday_midnight<0: # value is before yesterdays midnight
 					prev_day_idx = i
 				else:
@@ -366,6 +363,7 @@ class Collector:
 		self.min_dist_between_stops = 0
 		self.min_time_between_stops = 0
 		self.stop_radius = 0
+		self.late_time = 5
 
 		self.slack_client = None
 		self.slack_channel = None
@@ -383,6 +381,8 @@ class Collector:
 		self.setup()
 		self.init_logs()
 
+		self.observed_late = dict() # stores times fow which lateness is bein collected - this way we can quickly when an update is required based on the requested number of minutes
+
 	def set_min_distance_to_stop(self,min_distance_to_stop):
 		self.min_dist_to_stop = min_distance_to_stop
 
@@ -397,6 +397,9 @@ class Collector:
 
 	def set_order(self,order):
 		self.order_n = order
+
+	def set_late_time(self,late_time):
+		self.late_time = late_time
 
 	def set_slack(self,sc,channel):
 		self.slack_client = sc
@@ -473,6 +476,9 @@ class Collector:
 
 					stop_departed = 0
 					for d in departures:
+						# remove lateness before the current departure
+						self.observed_late = {k:v for k,v in self.observed_late.items() if not (k[0]==sid and k[1] < d[1])}
+
 						stop_departed = 1
 						message = "{0} : {1} departed at {2} ({3})".format(self.stops[sid].get_name(),v["id"],d[0],d[1])
 						try:
@@ -494,11 +500,27 @@ class Collector:
 		lateness = self.collect_late()
 		for sid,lv in lateness.items():
 			for l in lv:
-				hrs = l[1] // 3600
-				mns = (l[1] % 3600) // 60
-				sec = l[1] % 60
-				message = "{0} : {1} has not yet departed ({2}:{3}:{4}))".format(self.stops[sid].get_name(),str(l[0]),str(hrs),str(mns),str(sec))
-				print(message)
+				self.observed_late.setdefault((sid,l[1]),self.late_time)
+				# check whether it is time to report lateness
+				if l[1]>=self.observed_late[(sid,l[1])]:
+					self.observed_late[(sid,l[1])]+=self.late_time # increment for the next time to check for lateness
+
+					hrs = int(l[1] // 3600)
+					mns = int((l[1] % 3600) // 60)
+					sec = int(l[1] % 60)
+					late_message = "{0} : {1} has not yet departed ({2}:{3}:{4}))".format(self.stops[sid].get_name(),str(l[0]),str(hrs),str(mns),str(sec))
+					print(late_message)
+
+					try:
+						result = self.slack_client.chat_postMessage(
+							channel=self.slack_channel,
+							text=late_message
+						)
+
+					except:
+						print("error posting to slack: "+late_message)
+
+					print(late_message)
 
 	def start_collecting(self):
 		lock = threading.Lock()
@@ -592,6 +614,7 @@ def run(args):
 	collector.set_min_time_between_stops(args.min_time_diff)
 	collector.set_stop_radius(args.stop_radius)
 	collector.set_order(args.order)
+	collector.set_late_time(args.late_min)
 	collector.set_slack(sc,args.slack_channel)
 	collector.start_collecting()
 
@@ -636,6 +659,11 @@ def main(args):
 						required=True,
 						type=str,
 						help="Name or ID of the slack chnnel to which the bot will post departures and other information")
+	parser.add_argument("--late_min",
+						required=False,
+						type=int,
+						default=5,
+						help="number of minutes after whichto send late notifications to slack. Updates will then arrive every N minutes where N is the value specified by this argument.")
 
 
 	parser.set_defaults(func=run)

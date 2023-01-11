@@ -17,7 +17,6 @@ from slack import WebClient
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 
 from flask import Flask, render_template, request
-app = Flask(__name__)
 
 # courtesy of https://www.omnicalculator.com/other/latitude-longitude-distance
 def deg2rad(deg):
@@ -76,34 +75,50 @@ class Schedule:
                          [[x, []] for x in self.sun]]
 
     def get_today_json(self):
-        # todo: when the bus is running late - compute the lateness here as the difference fcurrent time to scheduled time
         res = dict({"data": dict()})
-        today_weekday = datetime.today().weekday()
-        today_date = datetime.today().date()
+        cur_time = datetime.now()
+        today_weekday = cur_time.weekday()
+        today_date = cur_time.date()
         for v in self.schedule[today_weekday]:
             str_time = v[0].strftime("%H:%M")
             str_hr = v[0].strftime("%H")
             res["data"].setdefault(str_hr, [])
 
-            if len(v[1]) == 0:
-                res["data"][str_hr].append([str_time, "NA", '#b3b3b3'])
-                continue
+            past_schedule = int((cur_time - datetime.combine(today_date, v[0])).total_seconds()/60)
+            if past_schedule < 0:
+                past_schedule = max([-30, past_schedule])
+            if past_schedule > 0:
+                past_schedule = min(30, past_schedule)
 
-            # get closest value to the stop time
-            idx = np.argmin(
-                [abs(datetime.combine(today_date, x) - datetime.combine(today_date, v[0])).total_seconds() for x in
-                 v[1]])
-            closest = v[1][idx]
-            closest_off = int(
-                ((datetime.combine(today_date, closest) - datetime.combine(today_date, v[0])).total_seconds()) / 60)
+            closest_str = "NA"
+            color = '#b3b3b3'
+            if len(v[1]) == 0  and past_schedule > 0:
+                color = self.cp[past_schedule+30]
 
-            # set min max bounds
-            if closest_off < 0:
-                closest_off = max(-30, closest_off)
-            if closest_off > 0:
-                closest_off = min(30, closest_off)
+            if len(v[1]) > 0:
+                # get closest value to the stop time
+                idx = np.argmin(
+                    [abs(datetime.combine(today_date, x) - datetime.combine(today_date, v[0])).total_seconds() for x in
+                     v[1]])
+                closest = v[1][idx]
+                closest_off = int(
+                    ((datetime.combine(today_date, closest) - datetime.combine(today_date, v[0])).total_seconds()) / 60)
 
-            res["data"][str_hr].append([str_time, closest.strftime("%H:%M"), self.cp[closest_off + 30]])
+                # set min max bounds
+                if closest_off < 0:
+                    if past_schedule > 0 and abs(past_schedule) < abs(closest_off): # past schedule is closer than the nearest departure in the past - report this
+                        closest_off = past_schedule
+                    else:
+                        closest_off = max([-30, closest_off])
+                        closest.strftime("%H:%M")
+
+                if closest_off > 0:
+                    closest_off = min(30, closest_off)
+
+                closest_str = closest.strftime("%H:%M")
+                color = self.cp[closest_off+30]
+
+            res["data"][str_hr].append([str_time, closest_str, color])
 
         res["rows"] = list(res["data"])  # one row for each hour
         res["ncols"] = max([len(v) for k, v in res["data"].items()])
@@ -151,8 +166,8 @@ class Schedule:
                 found_stop = True
                 # add to the next stop
                 self.schedule[depart_weekday][i][1].append(depart_time)
-            if i > 0:
-                self.schedule[depart_weekday][i - 1][1].append(depart_time)
+                if i > 0:
+                    self.schedule[depart_weekday][i - 1][1].append(depart_time)
 
             if found_stop:
                 next_idx = i
@@ -674,18 +689,7 @@ def generator():
         json = collector.get_today_json()
         yield json
 
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-genout = generator() # initate the function out of the scope of update route
-
-@app.route("/update",methods=['GET'])
-def update():
-    global genout
-    return next(genout)
-
-def run(args):
+def run_collection(args):
     sc = WebClient(SLACK_BOT_TOKEN)
 
     if not os.path.exists(args.output):
@@ -704,7 +708,21 @@ def run(args):
     collector.set_slack(sc, args.slack_channel)
     collector.start_collecting()
 
-    app.run(debug=True)
+    app = Flask(__name__)
+
+    @app.route('/')
+    def index():
+        return render_template('index.html')
+
+    # genout = generator()  # initate the function out of the scope of update route
+
+    @app.route("/update", methods=['GET'])
+    def update():
+        global collector
+        return collector.get_today_json()
+
+    app.run()
+
 
 def main(args):
     parser = argparse.ArgumentParser(description='''Help Page''')
@@ -752,7 +770,7 @@ def main(args):
                         default=5,
                         help="number of minutes after whichto send late notifications to slack. Updates will then arrive every N minutes where N is the value specified by this argument.")
 
-    parser.set_defaults(func=run)
+    parser.set_defaults(func=run_collection)
     args = parser.parse_args()
     args.func(args)
 

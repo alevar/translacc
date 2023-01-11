@@ -13,6 +13,8 @@ from itertools import product
 from scipy.signal import argrelextrema
 from datetime import datetime, date, timezone, timedelta
 
+import seaborn as sns
+
 from slack import WebClient
 
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
@@ -22,7 +24,6 @@ SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 def deg2rad(deg):
     rad = deg * math.pi / 180.0
     return rad
-
 
 def sphDist(lat1, long1, lat2, long2):
     r = 6371 * 1000
@@ -64,6 +65,8 @@ class Schedule:
 
         self.last_departure = datetime.now().time()
 
+        self.cp = sns.color_palette("vlag",61).as_hex() # colorpalette
+
     def reset(self):
         self.schedule = [[[x, []] for x in self.week],
                          [[x, []] for x in self.week],
@@ -73,6 +76,37 @@ class Schedule:
                          [[x, []] for x in self.sat],
                          [[x, []] for x in self.sun]]
 
+    def get_today_json(self):
+        res = dict({"data":dict()})
+        today_weekday = datetime.today().weekday()
+        today_date = datetime.today().date()
+        for v in self.schedule[today_weekday]:
+            str_time = v[0].strftime("%H:%M")
+            str_hr = v[0].strftime("%H")
+            res["data"].setdefault(str_hr,[])
+
+            if len(v[1])==0:
+                res["data"][str_hr].append([str_time,"NA",'#b3b3b3'])
+                continue
+
+            # get closest value to the stop time
+            idx = np.argmin([abs(datetime.combine(today_date,x)-datetime.combine(today_date,v[0])).total_seconds() for x in v[1]])
+            closest = v[1][idx]
+            closest_off = int(((datetime.combine(today_date,closest)-datetime.combine(today_date,v[0])).total_seconds())/60)
+
+            # set min max bounds
+            if closest_off<0:
+                closest_off = max(-30,closest_off)
+            if closest_off>0:
+                closest_off = min(30,closest_off)
+
+            res["data"][str_hr].append([str_time,closest.strftime("%H:%M"),self.cp[closest_off+30]])
+
+        res["rows"] = list(res["data"]) # one row for each hour
+        res["ncols"] = max([len(v) for k,v in res["data"].items()])
+
+        return res
+
     def parse_times(self, tms):
         res = []
         for x in tms:
@@ -81,15 +115,6 @@ class Schedule:
             res.append(tst)
 
         return sorted(res)
-
-    def get_last(self):
-        wd = datetime.now().weekday()
-        if wd == 5:  # saturday
-            return self.sat[-1]
-        elif wd == 6:
-            return self.sun[-1]
-        else:
-            return self.week[-1]
 
     # colors - blue to red (black when not yet available) - blue means departed early - red means departed late
     def add_departure(self, vid, timestamp):
@@ -217,41 +242,49 @@ class Stop:
         assert vid in self.v_distances, "requested vehicle is not available"
 
         # find local minima etc
-        closest_dist_idxs = argrelextrema(np.array(self.v_distances[vid][1]), np.less_equal, order=order_n)[
-            0]  # todo: replace container list with np.array to avoid this conversions
+        tmp_indices_1 = argrelextrema(np.array(self.v_distances[vid][1]), np.less_equal, order=order_n)[0]  # todo: replace container list with np.array to avoid conversions
         # select all that are also closer than min distance
-        closest_dist_idxs = [c for c in closest_dist_idxs if self.v_distances[vid][1][c] < min_dist_to_stop]
+        tmp_indices_2 = [c for c in tmp_indices_1 if self.v_distances[vid][1][c] < min_dist_to_stop]
+
         # remove duplicates close in time
-        res = []
-        for ci in closest_dist_idxs:
+        close_dist_indices = []
+        for ci in tmp_indices_2:
             if any(abs(self.v_distances[vid][0][ci] - timestamp_b) < min_time_between_stops for timestamp_b in
                    self.v_distances[vid][0][:ci]):
                 continue
-            res.append(ci)
+            close_dist_indices.append(ci)
 
         # make sure appropriate distance has been travelled or that the bus departed if the first in the day
-        closest_dist_idxs = []
+        indices = []
         found_stop = 0
         prev_idx = 0
         trim_to_idx = 0  # index to which the observations are to be trimmed if stops found
-        for i, c in enumerate(res):
-            if i == len(res) - 1:  # last one
+        for i, c in enumerate(close_dist_indices):
+            if i == len(close_dist_indices) - 1:  # last one
                 remaining_dists = self.v_distances[vid][1][c:]
                 if len(remaining_dists) > 0 and max(
                         remaining_dists) > min_dist_to_stop:  # departed from last observation
-                    closest_dist_idxs.append(c)
+                    indices.append(c)
                     found_stop = 1
                     trim_to_idx = len(self.v_distances[vid][1])
             else:
-                sub_dists = self.v_distances[vid][1][c:res[i + 1]]  # distance between current and next index
+                sub_dists = self.v_distances[vid][1][c:close_dist_indices[i + 1]]  # distance between current and next index
                 if len(sub_dists) > 0 and max(sub_dists) >= min_dist_between_stops:
-                    closest_dist_idxs.append(c)
+                    indices.append(c)
                     prev_idx = c
                     found_stop = 1
-                    trim_to_idx = res[i + 1]
+                    trim_to_idx = close_dist_indices[i + 1]
+
+        # print("f1: "+str(len(tmp_indices_1)))
+        # print(list(self.v_distances))
+        # print(len(self.v_distances[vid]))
+        # print(len(self.v_distances[vid][1]))
+        # print("f2: "+str(len(tmp_indices_2)))
+        # print("f3: "+str(len(close_dist_indices)))
+        # print("f4: "+str(len(indices)))
 
         departures = []
-        for c in closest_dist_idxs:
+        for c in indices:
             # find the first index for which position is greater than radius
             npl = self.v_distances[vid][1][c:]
             cur_radius = npl[0] + stop_radius  # minimum plus radius
@@ -274,8 +307,6 @@ class Stop:
 
         # if departure is found - record it and remove the vehicle record up to this point
         return departures
-
-    # todo: idintify missed schedule
 
     def get_delta(self, t1, t2):
         ct1 = datetime.combine(date.today(), t1)
@@ -326,7 +357,7 @@ class Stop:
             # reset to before yesterdays midnight
             prev_day_idx = None
             for i, v in enumerate(data[0]):
-                if v - yesterday_midnight < 0:  # value is before yesterdays midnight
+                if datetime.fromtimestamp(v/1000) - yesterday_midnight < 0:  # value is before yesterdays midnight
                     prev_day_idx = i
                 else:
                     break
@@ -454,7 +485,7 @@ class Collector:
 
         if self.log_date != date.today():  # trigger resets and cleanup of old data
             self.log_date = date.today()
-            res = self.reset()  # todo: transfer data?
+            res = self.reset()
 
         url = "https://feeds.transloc.com/3/vehicle_statuses?agencies=641&include_arrivals=true"
         payload = {}
@@ -497,6 +528,7 @@ class Collector:
                         stop_departed = 1
                         message = "{0} : {1} departed at {2} ({3})".format(self.stops[sid].get_name(), v["id"], d[0],
                                                                            d[1])
+                        print(message)
                         try:
                             result = self.slack_client.chat_postMessage(
                                 channel=self.slack_channel,
@@ -528,6 +560,7 @@ class Collector:
                     late_message = "{0} : {1} has not yet departed ({2}:{3}:{4}))".format(self.stops[sid].get_name(),
                                                                                           str(l[0]), str(hrs), str(mns),
                                                                                           str(sec))
+                    print(late_message)
                     try:
                         result = self.slack_client.chat_postMessage(
                             channel=self.slack_channel,

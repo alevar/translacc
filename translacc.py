@@ -42,6 +42,8 @@ def distance(l1, l2):
     res = sphDist(deg2rad(l1[0]), deg2rad(l1[1]), deg2rad(l2[0]), deg2rad(l2[1]))
     return res
 
+def scale_val(v, min_new, max_new, min_cur, max_cur):
+    return (max_new - min_new) * (v - min_cur) / (max_cur - min_cur) + min_new;
 
 class Schedule:
     def __init__(self, week, sat, sun):
@@ -79,16 +81,34 @@ class Schedule:
         cur_time = datetime.now()
         today_weekday = cur_time.weekday()
         today_date = cur_time.date()
-        for v in self.schedule[today_weekday]:
+        for vi,v in enumerate(self.schedule[today_weekday]):
             str_time = v[0].strftime("%H:%M")
             str_hr = v[0].strftime("%H")
             res["data"].setdefault(str_hr, [])
 
-            past_schedule = int((cur_time - datetime.combine(today_date, v[0])).total_seconds()/60)
+            v0_datetime = datetime.combine(today_date, v[0])
+
+            # get number of minutes from the previous stop and number of minutes to the next stop
+            min_bound = -30
+            max_bound = 30
+            if vi>0: # there are stops before this
+                vim1_datetime = datetime.combine(today_date, self.schedule[today_weekday][vi-1][0])
+                stop_diff = int((vim1_datetime - v0_datetime).total_seconds()/60)
+                min_bound = max(min_bound,stop_diff)
+            if vi<len(self.schedule[today_weekday])-1: # there are stops after this
+                vip1_datetime = datetime.combine(today_date, self.schedule[today_weekday][vi+1][0])
+                stop_diff = int((vip1_datetime - v0_datetime).total_seconds()/60)
+                max_bound = min(max_bound,stop_diff)
+
+            # scale the values to -30/+30
+
+            past_schedule = int((cur_time - v0_datetime).total_seconds()/60)
             if past_schedule < 0:
-                past_schedule = max([-30, past_schedule])
+                past_schedule = max([min_bound, past_schedule])
+                past_schedule = int(scale_val(past_schedule,-30,0,min_bound,0))
             if past_schedule > 0:
-                past_schedule = min(30, past_schedule)
+                past_schedule = min(max_bound, past_schedule)
+                past_schedule = int(scale_val(past_schedule, 0, 30, 0, max_bound))
 
             closest_str = "NA"
             color = '#b3b3b3'
@@ -109,11 +129,13 @@ class Schedule:
                     if past_schedule > 0 and abs(past_schedule) < abs(closest_off): # past schedule is closer than the nearest departure in the past - report this
                         closest_off = past_schedule
                     else:
-                        closest_off = max([-30, closest_off])
+                        closest_off = max([min_bound, closest_off])
+                        closest_off = int(scale_val(closest_off,-30,0,min_bound,0)) # normalize
                         closest.strftime("%H:%M")
 
                 if closest_off > 0:
-                    closest_off = min(30, closest_off)
+                    closest_off = min(max_bound, closest_off)
+                    closest_off = int(scale_val(closest_off,0,30,0,max_bound)) # normalize
 
                 closest_str = closest.strftime("%H:%M")
                 color = self.cp[closest_off+30]
@@ -259,10 +281,10 @@ class Stop:
                stop_radius):  # returns 0 if no new departure detected - returns 1 if there is departure
         assert vid in self.v_distances, "requested vehicle is not available"
 
-        # find local minima etc
-        tmp_indices_1 = argrelextrema(np.array(self.v_distances[vid][1]), np.less_equal, order=order_n)[0]  # todo: replace container list with np.array to avoid conversions
+        # todo: why do we even need this? find local minima etc
+        # tmp_indices_1 = argrelextrema(np.array(self.v_distances[vid][1]), np.less_equal, order=order_n)[0]  # todo: replace container list with np.array to avoid conversions
         # select all that are also closer than min distance
-        tmp_indices_2 = [c for c in tmp_indices_1 if self.v_distances[vid][1][c] < min_dist_to_stop]
+        tmp_indices_2 = [i for i,c in enumerate(self.v_distances[vid][1]) if c < min_dist_to_stop]
 
         # remove duplicates close in time
         close_dist_indices = []
@@ -320,8 +342,11 @@ class Stop:
 
         # lastly, clean up distances up until this departure to prepare for the next round
         if found_stop:
+            print("resetting v_distances: ",vid,self.id)
+            print("before:",self.v_distances[vid][1])
             self.v_distances[vid][0] = self.v_distances[vid][0][trim_to_idx:]
             self.v_distances[vid][1] = self.v_distances[vid][1][trim_to_idx:]
+            print("after: ",self.v_distances[vid][1])
 
         # if departure is found - record it and remove the vehicle record up to this point
         return departures

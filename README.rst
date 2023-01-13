@@ -12,7 +12,9 @@ TranslAcc
 Introduction
 ^^^^^^^^^^^^
 
-.. figure:: https://raw.githubusercontent.com/alevar/translacc/master/extras/slow.cut.001.gif
+.. image:: https://raw.githubusercontent.com/alevar/translacc/master/extras/slow.cut.001.gif
+   :alt: StreamPlayer
+   :align: center
 
 ORFanage aids in finding the best matching ORF for each transcript in the
 GTF file based on evidence from one or more reference annotaitons. The method is designed to

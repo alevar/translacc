@@ -232,9 +232,10 @@ class Schedule:
 
 
 class Vehicle:
-    def __init__(self, vid, route_id):
+    def __init__(self, vid, route_id,name):
         self.vid = vid
         self.route_id = route_id
+        self.name = name
         self.travel = []
 
     def update(self, timestamp, position):
@@ -248,6 +249,9 @@ class Vehicle:
 
     def get_id(self):
         return self.vid
+
+    def get_name(self):
+        return self.name
 
 
 class Stop:
@@ -289,6 +293,8 @@ class Stop:
         # remove duplicates close in time
         close_dist_indices = []
         for ci in tmp_indices_2:
+            if ci>=len(self.v_distances[vid][0]):
+                print("wrong index")
             if any(abs(self.v_distances[vid][0][ci] - timestamp_b) < min_time_between_stops for timestamp_b in
                    self.v_distances[vid][0][:ci]):
                 continue
@@ -400,7 +406,7 @@ class Stop:
             # reset to before yesterdays midnight
             prev_day_idx = None
             for i, v in enumerate(data[0]):
-                if datetime.fromtimestamp(v/1000) - yesterday_midnight < 0:  # value is before yesterdays midnight
+                if (datetime.fromtimestamp(v/1000) - yesterday_midnight).total_seconds() < 0:  # value is before yesterdays midnight
                     prev_day_idx = i
                 else:
                     break
@@ -530,7 +536,7 @@ class Collector:
         return res
 
     def _collecting(self, lock):
-        threading.Timer(1.0, self._collecting, [lock]).start()
+        threading.Timer(1, self._collecting, [lock]).start()
 
         # check if day passed - if did - reset
         midnight = datetime.combine(date.today(), datetime.min.time())  # midnight
@@ -558,72 +564,73 @@ class Collector:
             exit(1)
 
         # for each stop we can now check which buses crossed it and estimate time at which the stop occurred
-        for v in output["vehicles"]:
-            # check that the vehicle belongs to the correct route
-            if not v["route_id"] == self.route_id:
-                continue
+        with lock:
+            for v in output["vehicles"]:
+                # check that the vehicle belongs to the correct route
+                if not v["route_id"] == self.route_id:
+                    continue
 
-            # update vehicle positioning if changed
-            self.vehicles.setdefault(v["id"], Vehicle(v["id"], v["route_id"]))
-            updated = self.vehicles[v["id"]].update(v["timestamp"], v["position"])
+                # update vehicle positioning if changed
+                self.vehicles.setdefault(v["id"], Vehicle(v["id"], v["route_id"],v["call_name"]))
+                updated = self.vehicles[v["id"]].update(v["timestamp"], v["position"])
 
-            if updated:
-                for sid in self.stops:
-                    stop_dist = self.stops[sid].update(v["id"], v["timestamp"], v["position"])
-                    departures = self.stops[sid].depart(v["id"], self.order_n, self.min_dist_to_stop,
-                                                        self.min_dist_between_stops, self.min_time_between_stops,
-                                                        self.stop_radius)  # check if departed - if did mark and edit accordingly - resets the vehicle history for the stop and for the vehicle
+                if updated:
+                    for sid in self.stops:
+                        stop_dist = self.stops[sid].update(v["id"], v["timestamp"], v["position"])
+                        departures = self.stops[sid].depart(v["id"], self.order_n, self.min_dist_to_stop,
+                                                            self.min_dist_between_stops, self.min_time_between_stops,
+                                                            self.stop_radius)  # check if departed - if did mark and edit accordingly - resets the vehicle history for the stop and for the vehicle
 
-                    stop_departed = 0
-                    for d in departures:
-                        # remove lateness before the current departure
-                        self.observed_late = {k: v for k, v in self.observed_late.items() if
-                                              not (k[0] == sid and k[1] < datetime.fromtimestamp(d[1]).time())}
+                        stop_departed = 0
+                        for d in departures:
+                            # remove lateness before the current departure
+                            self.observed_late = {k: v for k, v in self.observed_late.items() if
+                                                  not (k[0] == sid and k[1] < datetime.fromtimestamp(d[1]).time())}
 
-                        stop_departed = 1
-                        message = "{0} : {1} departed at {2} ({3})".format(self.stops[sid].get_name(), v["id"], d[0],
-                                                                           d[1])
-                        print(message)
-                        try:
-                            result = self.slack_client.chat_postMessage(
-                                channel=self.slack_channel,
-                                text=message
-                            )
+                            stop_departed = 1
+                            message = "{0} : {1} departed at {2} ({3})".format(self.stops[sid].get_name(), v["call_name"], d[0],
+                                                                               d[1])
+                            print(message)
+                            try:
+                                result = self.slack_client.chat_postMessage(
+                                    channel=self.slack_channel,
+                                    text=message
+                                )
 
-                        except:
-                            print("error posting to slack: " + message)
+                            except:
+                                print("error posting to slack: " + message)
 
-                    with lock:
+                        # with lock:
                         out_line = str(sid) + "," + str(v["id"]) + "," + str(v["timestamp"]) + "," + str(
                             stop_dist) + "," + str(stop_departed) + "\n"
                         self.log_all_fp.write(out_line)
 
-        # collect lateness info
-        # since it's being collected independent of departures
-        # it can detect when something is behind schedule before a new departure occurs
-        lateness = self.collect_late()
-        for sid, lv in lateness.items():
-            for l in lv:
-                self.observed_late.setdefault((sid, l[0]), self.late_time)
-                # check whether it is time to report lateness
-                if l[1] >= self.observed_late[(sid, l[0])] * 60:
-                    self.observed_late[(sid, l[0])] += self.late_time  # increment for the next time
+            # collect lateness info
+            # since it's being collected independent of departures
+            # it can detect when something is behind schedule before a new departure occurs
+            lateness = self.collect_late()
+            for sid, lv in lateness.items():
+                for l in lv:
+                    self.observed_late.setdefault((sid, l[0]), self.late_time)
+                    # check whether it is time to report lateness
+                    if l[1] >= self.observed_late[(sid, l[0])] * 60:
+                        self.observed_late[(sid, l[0])] += self.late_time  # increment for the next time
 
-                    hrs = int(l[1] // 3600)
-                    mns = int((l[1] % 3600) // 60)
-                    sec = int(l[1] % 60)
-                    late_message = "{0} : {1} has not yet departed ({2}:{3}:{4}))".format(self.stops[sid].get_name(),
-                                                                                          str(l[0]), str(hrs), str(mns),
-                                                                                          str(sec))
-                    print(late_message)
-                    try:
-                        result = self.slack_client.chat_postMessage(
-                            channel=self.slack_channel,
-                            text=late_message
-                        )
+                        hrs = int(l[1] // 3600)
+                        mns = int((l[1] % 3600) // 60)
+                        sec = int(l[1] % 60)
+                        late_message = "{0} : {1} has not yet departed ({2}:{3}:{4}))".format(self.stops[sid].get_name(),
+                                                                                              str(l[0]), str(hrs), str(mns),
+                                                                                              str(sec))
+                        print(late_message)
+                        try:
+                            result = self.slack_client.chat_postMessage(
+                                channel=self.slack_channel,
+                                text=late_message
+                            )
 
-                    except:
-                        print("error posting to slack: " + late_message)
+                        except:
+                            print("error posting to slack: " + late_message)
 
     def start_collecting(self):
         lock = threading.Lock()

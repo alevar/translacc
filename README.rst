@@ -12,15 +12,13 @@ TranslAcc
 Introduction
 ^^^^^^^^^^^^
 
-.. only:: html
+.. image:: https://raw.githubusercontent.com/alevar/translacc/master/extras/slow.cut.001.gif
 
-   .. figure:: https://raw.githubusercontent.com/alevar/translacc/master/extras/slow.cut.001.gif
-
-    ORFanage aids in finding the best matching ORF for each transcript in the
-    GTF file based on evidence from one or more reference annotaitons. The method is designed to
-    identify cases of known ORFs fitting the query transcript both with and without modifications,
-    introduced by additional exons, alternative start and end sites, etc. ORFanage is also designed
-    to quantify any changes to the reference annotation which are introduced by the splice variation.
+ORFanage aids in finding the best matching ORF for each transcript in the
+GTF file based on evidence from one or more reference annotaitons. The method is designed to
+identify cases of known ORFs fitting the query transcript both with and without modifications,
+introduced by additional exons, alternative start and end sites, etc. ORFanage is also designed
+to quantify any changes to the reference annotation which are introduced by the splice variation.
 
 Installation
 ^^^^^^^^^^^^

@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Document</title>
+    <link rel= "stylesheet"  href= "{{ url_for('static', filename='styles.css')}}">
+    <style>
+        table{border-collapse:collapse;border-spacing:0}
+        td,th{border:1px solid #000; padding:2px}
+        caption{font-size: 14px;font-weight: bold}
+        .hrname{font-weight: bold; font-size:22}
+        .d{width:60px}
+        .t{height:60px}
+.inlineTable {
+            display: inline-block;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="table_div">
+        <table id="table0" class="inlineTable">
+        </table>
+        <table id="table1" class="inlineTable">
+        </table>
+    </div>
+
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js" integrity="sha256-/xUj+3OJU5yExlq6GSYGSHk7tPXikynS7ogEvDej/m4=" crossorigin="anonymous"></script>
+    <script>
+        function tableCreate(data) {
+            for (let s=0;s<data["stops"].length;s++){
+                var stop_name = data["stops"][s];
+
+                var tid = "table"+s.toString()
+                sub = data["stop_data"][stop_name]
+
+                var oldTable = document.getElementById(tid);
+                var tbl = document.createElement("table");
+                tbl.setAttribute("id", tid);
+
+                var caption = document.createElement('caption');
+                caption.append(stop_name);
+                tbl.appendChild(caption);
+
+                tbl.style.width = '100px';
+                tbl.style.border = '1px solid black';
+
+                for (let i = 0; i < sub["rows"].length; i++) {
+                    var hr = sub["rows"][i]
+                    const tr = tbl.insertRow();
+                    for (let j = 0; j < sub["ncols"]+1; j++) {
+                        if(j>=sub["data"][hr].length+1){
+                            break;
+                        }
+                        const td = tr.insertCell();
+                        if(j==0){ // set as the hour name
+                            td.appendChild(document.createTextNode(hr));
+                        }
+                        else{
+                            td.setAttribute("bgcolor",sub["data"][hr][j-1][2]);
+                            td.setAttribute("title",sub["data"][hr][j-1][1]);
+                            td.appendChild(document.createTextNode(sub["data"][hr][j-1][0]));
+                        }
+                        td.style.border = '1px solid black';
+                    }
+                }
+                oldTable.parentNode.replaceChild(tbl, oldTable);
+            }
+        }
+        function update(){
+            $.get("/update", function(data){
+                tableCreate(data);
+            });
+        }
+        update()
+        var intervalId = setInterval(function() {
+            update()
+        }, 5000);
+
+    </script>
+
+</body>
+</html>

@@ -63,7 +63,7 @@ class Schedule:
         self.schedule_sets = [0, 0, 0, 0, 0, 0,
                               0]  # if set - means the day has been passed - that's how we know the week passed and the value needs cleaning
 
-        self.last_departure = datetime.now().time()
+        self.last_departure = datetime.timestamp(datetime.now())
 
         self.cp = sns.color_palette("vlag",61).as_hex() # colorpalette
 
@@ -75,6 +75,9 @@ class Schedule:
                          [[x, []] for x in self.week],
                          [[x, []] for x in self.sat],
                          [[x, []] for x in self.sun]]
+
+    def get_last_departure(self):
+        return self.last_departure
 
     def get_today_json(self):
         res = dict({"data": dict()})
@@ -116,7 +119,7 @@ class Schedule:
                 color = self.cp[past_schedule+30]
 
             if len(v[1]) > 0:
-                # get closest value to the stop time
+                # get the closest value to the stop time
                 idx = np.argmin(
                     [abs(datetime.combine(today_date, x) - datetime.combine(today_date, v[0])).total_seconds() for x in
                      v[1]])
@@ -167,7 +170,7 @@ class Schedule:
         depart_weekday = tm.weekday()
         depart_date = tm.date()
         depart_time = tm.time()
-        self.last_departure = depart_time
+        self.last_departure = max(self.last_departure,timestamp/1000)
 
         found_stop = False
         next_idx = None
@@ -178,7 +181,7 @@ class Schedule:
             tmp = [x[0] for x in self.schedule[tomorrow_weekday]]
             self.schedule[tomorrow_weekday] = [[x, []] for x in tmp]
 
-        # set todays data as being written
+        # set today's data as being written
         self.schedule_sets[depart_weekday] = 1
 
         for i in range(len(self.schedule[depart_weekday])):
@@ -214,19 +217,18 @@ class Schedule:
         ctime = cnow.time()
         weekday = cnow.weekday()
         for s in self.schedule[weekday]:
-            if s[
-                0] < self.last_departure:  # not interested anymore - values will not update anymore since before the latest departure
+            stop_time = datetime.combine(cdate, s[0])
+            if datetime.timestamp(stop_time) < self.last_departure:  # not interested anymore - values will not update anymore since before the latest departure
                 continue
             if s[0] > ctime:  # found stop after the current time - no need to look further
                 break
 
-            stop_time = datetime.combine(cdate, s[0])
             td = (cnow - stop_time).total_seconds()
 
-            res.append([s[0], abs(td)])
+            # also compute time since last departure
+            tdld = (stop_time-datetime.fromtimestamp(self.last_departure)).total_seconds()
 
-        # todo: report negative when departed earlier
-        # todo: only report if >n minutes late
+            res.append([s[0], abs(td), abs(tdld)])
 
         return res
 
@@ -300,6 +302,14 @@ class Stop:
                 continue
             close_dist_indices.append(ci)
 
+
+        # we also need to make sure that the departure is in the correct direction
+        # eg. if the shuttle left for break in the wrong direction - we do not want to report it
+        # can be detected by computing the distance between two opposing stops and making sure the difference between current position and that distance is less than stop_radius
+
+        for ci in tmp_indices_2:
+            if ci
+
         # make sure appropriate distance has been travelled or that the bus departed if the first in the day
         indices = []
         found_stop = 0
@@ -346,13 +356,13 @@ class Stop:
                 print("schedule is now None")
             self.schedule.add_departure(vid, self.v_distances[vid][0][c + radius_idx])
 
-        # lastly, clean up distances up until this departure to prepare for the next round
+        # lastly, clean distances up until this departure to prepare for the next round
         if found_stop:
-            print("resetting v_distances: ",vid,self.id)
-            print("before:",self.v_distances[vid][1])
+            # print("resetting v_distances: ",vid,self.id)
+            # print("before:",self.v_distances[vid][1])
             self.v_distances[vid][0] = self.v_distances[vid][0][trim_to_idx:]
             self.v_distances[vid][1] = self.v_distances[vid][1][trim_to_idx:]
-            print("after: ",self.v_distances[vid][1])
+            # print("after: ",self.v_distances[vid][1])
 
         # if departure is found - record it and remove the vehicle record up to this point
         return departures
@@ -426,6 +436,9 @@ class Stop:
     def get_late(self):
         return self.schedule.get_late()
 
+    def get_last_departure(self):
+        self.schedule.get_last_departure()
+
     def set_schedule(self, week, sat, sun):
         self.schedule = Schedule(week, sat, sun)
 
@@ -458,9 +471,11 @@ class Collector:
         self.min_time_between_stops = 0
         self.stop_radius = 0
         self.late_time = 5
+        self.permitted_early_departure_time = 1
 
         self.slack_client = None
-        self.slack_channel = None
+        self.slack_channel_late = None
+        self.slack_channel_depart = None
 
         # initialize output files
         self.outdir = outdir.rstrip("/") + "/"
@@ -495,9 +510,13 @@ class Collector:
     def set_late_time(self, late_time):
         self.late_time = late_time
 
-    def set_slack(self, sc, channel):
+    def set_permitted_early_departure_time(self,permitted_early_departure_time):
+        self.permitted_early_departure_time = permitted_early_departure_time
+
+    def set_slack(self, sc, channel_late,channel_depart):
         self.slack_client = sc
-        self.slack_channel = channel
+        self.slack_channel_late = None if channel_late in ["",None] else channel_late
+        self.slack_channel_depart = None if channel_depart in ["",None] else channel_depart
 
     def init_logs(self):
         if self.log_all_fp is not None:
@@ -591,14 +610,15 @@ class Collector:
                             message = "{0} : {1} departed at {2} ({3})".format(self.stops[sid].get_name(), v["call_name"], d[0],
                                                                                d[1])
                             print(message)
-                            try:
-                                result = self.slack_client.chat_postMessage(
-                                    channel=self.slack_channel,
-                                    text=message
-                                )
+                            if self.slack_channel_depart is not None:
+                                try:
+                                    result = self.slack_client.chat_postMessage(
+                                        channel=self.slack_channel_depart,
+                                        text=message
+                                    )
 
-                            except:
-                                print("error posting to slack: " + message)
+                                except:
+                                    print("error posting to slack: " + message)
 
                         # with lock:
                         out_line = str(sid) + "," + str(v["id"]) + "," + str(v["timestamp"]) + "," + str(
@@ -612,25 +632,28 @@ class Collector:
             for sid, lv in lateness.items():
                 for l in lv:
                     self.observed_late.setdefault((sid, l[0]), self.late_time)
+                    # it is possible that departure occured before the stop
+                    # eg. we do not want to report lateness for the bus which departed more than 1 minute before its time
                     # check whether it is time to report lateness
-                    if l[1] >= self.observed_late[(sid, l[0])] * 60:
+                    if l[1] >= self.observed_late[(sid, l[0])] * 60 and l[2] >= self.permitted_early_departure_time*60:
                         self.observed_late[(sid, l[0])] += self.late_time  # increment for the next time
 
                         hrs = int(l[1] // 3600)
                         mns = int((l[1] % 3600) // 60)
                         sec = int(l[1] % 60)
-                        late_message = "{0} : {1} has not yet departed ({2}:{3}:{4}))".format(self.stops[sid].get_name(),
+                        late_message = "{0} : {1} has not departed yet ({2}:{3}:{4}))".format(self.stops[sid].get_name(),
                                                                                               str(l[0]), str(hrs), str(mns),
                                                                                               str(sec))
                         print(late_message)
-                        try:
-                            result = self.slack_client.chat_postMessage(
-                                channel=self.slack_channel,
-                                text=late_message
-                            )
+                        if not self.slack_channel_late is None:
+                            try:
+                                result = self.slack_client.chat_postMessage(
+                                    channel=self.slack_channel_late,
+                                    text=late_message
+                                )
 
-                        except:
-                            print("error posting to slack: " + late_message)
+                            except:
+                                print("error posting to slack: " + late_message)
 
     def start_collecting(self):
         lock = threading.Lock()
@@ -737,7 +760,8 @@ def run_collection(args):
     collector.set_stop_radius(args.stop_radius)
     collector.set_order(args.order)
     collector.set_late_time(args.late_min)
-    collector.set_slack(sc, args.slack_channel)
+    collector.set_permitted_early_departure_time(args.permitted_early_departure_time)
+    collector.set_slack(sc, args.slack_channel_late,args.slack_channel_depart)
     collector.start_collecting()
 
     app = Flask(__name__)
@@ -789,18 +813,29 @@ def main(args):
                         help="Minimum distance in meters between the location of the bus and location of the stop for the stop to be counted as reached.")
     parser.add_argument("--stop_radius",
                         required=False,
-                        default=50,
+                        default=100,
                         type=int,
                         help="Radius of each stop. The time at which the bus is reported to have departed a stop is calulated as the last time it was within the radius of it's closest position to the stop. For example, if a bus stopped 10 meters past the designated stopping position, once departure has been calulated, the departure will be calulated as the last time the bus was recorded 10+50m away from the stop position.")
-    parser.add_argument("--slack_channel",
+    parser.add_argument("--slack_channel_late",
                         required=True,
                         type=str,
-                        help="Name or ID of the slack chnnel to which the bot will post departures and other information")
+                        default=None,
+                        help="Name or ID of the slack channel to which the bot will post about missing departures")
+    parser.add_argument("--slack_channel_depart",
+                        required=True,
+                        type=str,
+                        default=None,
+                        help="Name or ID of the slack channel to which the bot will post about departures")
     parser.add_argument("--late_min",
                         required=False,
                         type=int,
                         default=5,
-                        help="number of minutes after whichto send late notifications to slack. Updates will then arrive every N minutes where N is the value specified by this argument.")
+                        help="number of minutes after which to send late notifications to slack. Updates will then arrive every N minutes where N is the value specified by this argument.")
+    parser.add_argument("--permitted_early_departure_time",
+                        required=False,
+                        type=int,
+                        default=1,
+                        help="Bus is allowed to depart this many minutes early without a penalty. If a shuttle departs within this many minutes prior to the scheduled departure - it is considered on time and lateness will not be computed..")
 
     parser.set_defaults(func=run_collection)
     args = parser.parse_args()
